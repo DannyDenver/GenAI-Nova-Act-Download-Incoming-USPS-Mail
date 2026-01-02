@@ -1,7 +1,8 @@
 # S3 bucket for storing mail images
 resource "aws_s3_bucket" "mail_images" {
-  bucket = "${local.name_prefix}-mail-images-${random_id.suffix.hex}"
-  tags   = local.common_tags
+  bucket        = "${local.name_prefix}-mail-images-${random_id.suffix.hex}"
+  force_destroy = true
+  tags          = local.common_tags
 }
 
 # S3 bucket versioning
