@@ -1,0 +1,3 @@
+nova-act
+awslambdaric
+boto3
