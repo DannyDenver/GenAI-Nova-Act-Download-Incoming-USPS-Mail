@@ -1,0 +1,15 @@
+# Copy this file to terraform.tfvars and fill in your values
+
+aws_region = "us-east-1"
+environment = "prod"
+
+# USPS account credentials
+usps_username="tellerminingclaim"
+usps_password="Jh+2DApq?!KY3Zj"
+
+# Optional: Customize schedule (default is 7 AM UTC daily)
+# schedule_expression = "cron(0 7 * * ? *)"
+
+# Optional: Adjust Lambda settings
+# lambda_timeout = 900      # 15 minutes
+# lambda_memory_size = 3008 # Maximum memory

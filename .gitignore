@@ -1,0 +1,73 @@
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/terraform.tfvars
+terraform/.terraform.tfstate.lock.info
+
+# Lambda deployment package
+lambda/usps_automation.zip
+lambda/function-package/
+lambda-layer/
+nova-act-layer.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.zshrc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+response.json
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# Nova Act logs and data
+conservative_mail_images/
+nova_act_logs/
+
+# AWS
+.aws/
+
+# Temporary files
+tmp/
+temp/
+NovaAct-USPS-Incoming-Mail/
