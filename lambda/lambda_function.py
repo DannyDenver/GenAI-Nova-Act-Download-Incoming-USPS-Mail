@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AWS Lambda function for USPS Informed Delivery automation.
-Adapted from the conservative USPS automation script.
+Main orchestration module that coordinates all components.
 """
 
 import os
@@ -10,12 +10,9 @@ import boto3
 import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-import requests
-from urllib.parse import urljoin
 
-from nova_act import NovaAct
-from nova_act.types.act_result import ActResult
-from nova_act.types.act_errors import ActAgentError, ActClientError, ActExecutionError, ActServerError
+# Import our custom modules
+from utils import USPSAuthenticator, MailImageExtractor, S3Uploader, NovaActConfig
 
 # Configure logging
 logger = logging.getLogger()
@@ -23,23 +20,27 @@ logger.setLevel(logging.INFO)
 
 
 class LambdaUSPSAutomator:
-    """Lambda-compatible USPS automation class."""
+    """Main Lambda automation orchestrator."""
     
     def __init__(self, s3_bucket: str, secret_name: str, aws_region: str):
         self.s3_bucket = s3_bucket
         self.secret_name = secret_name
         self.aws_region = aws_region
-        self.nova_act: Optional[NovaAct] = None
+        self.today = datetime.now().strftime("%Y-%m-%d")
         
         # Initialize AWS clients
-        self.s3_client = boto3.client('s3', region_name=aws_region)
         self.secrets_client = boto3.client('secretsmanager', region_name=aws_region)
         
         # Get credentials from Secrets Manager
         self.username, self.password = self._get_credentials()
         
-        # Create date-based folder structure
-        self.today = datetime.now().strftime("%Y-%m-%d")
+        # Initialize components
+        self.s3_uploader = S3Uploader(s3_bucket, aws_region)
+        self.nova_act_config = NovaActConfig("/tmp/nova_act_logs")
+        
+        # Will be initialized later
+        self.authenticator: Optional[USPSAuthenticator] = None
+        self.image_extractor: Optional[MailImageExtractor] = None
     
     def _get_credentials(self) -> tuple[str, str]:
         """Retrieve USPS credentials from AWS Secrets Manager."""
@@ -51,404 +52,9 @@ class LambdaUSPSAutomator:
             logger.error(f"Failed to retrieve credentials: {e}")
             raise
     
-    def _upload_to_s3(self, file_data: bytes, filename: str, content_type: str = 'image/png') -> bool:
-        """Upload file data to S3 with retry logic."""
-        s3_key = f"{self.today}/{filename}"
-        
-        for attempt in range(3):  # Retry up to 3 times
-            try:
-                self.s3_client.put_object(
-                    Bucket=self.s3_bucket,
-                    Key=s3_key,
-                    Body=file_data,
-                    ContentType=content_type,
-                    Metadata={
-                        'download-date': self.today,
-                        'source': 'usps-informed-delivery',
-                        'automation-version': '1.0'
-                    }
-                )
-                logger.info(f"✓ Uploaded to S3: {s3_key}")
-                return True
-            except Exception as e:
-                logger.warning(f"S3 upload attempt {attempt + 1} failed: {e}")
-                if attempt == 2:  # Last attempt
-                    logger.error(f"Failed to upload {filename} after 3 attempts")
-                    return False
-        return False
-    
-    def _upload_logs_to_s3(self) -> List[str]:
-        """Upload Nova Act logs to S3."""
-        uploaded_logs = []
-        
-        if not hasattr(self, 'logs_dir') or not os.path.exists(self.logs_dir):
-            logger.warning("No logs directory found to upload")
-            return uploaded_logs
-        
-        try:
-            # Walk through logs directory and upload all files
-            for root, dirs, files in os.walk(self.logs_dir):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    
-                    # Skip empty files
-                    if os.path.getsize(file_path) == 0:
-                        logger.debug(f"Skipping empty file: {file_path}")
-                        continue
-                    
-                    # Create relative path for S3 key
-                    rel_path = os.path.relpath(file_path, self.logs_dir)
-                    s3_key = f"{self.today}/logs/{rel_path}"
-                    
-                    try:
-                        # Determine content type based on file extension
-                        content_type = 'text/plain'
-                        if file.endswith('.json'):
-                            content_type = 'application/json'
-                        elif file.endswith('.html'):
-                            content_type = 'text/html'
-                        elif file.endswith('.png'):
-                            content_type = 'image/png'
-                        elif file.endswith('.log'):
-                            content_type = 'text/plain'
-                        
-                        # Read and upload file
-                        with open(file_path, 'rb') as f:
-                            file_data = f.read()
-                        
-                        self.s3_client.put_object(
-                            Bucket=self.s3_bucket,
-                            Key=s3_key,
-                            Body=file_data,
-                            ContentType=content_type,
-                            Metadata={
-                                'upload-date': self.today,
-                                'source': 'nova-act-logs',
-                                'automation-version': '1.0',
-                                'log-type': 'automation-trace',
-                                'file-size': str(len(file_data))
-                            }
-                        )
-                        
-                        uploaded_logs.append(f"s3://{self.s3_bucket}/{s3_key}")
-                        logger.info(f"✓ Uploaded log to S3: {s3_key} ({len(file_data)} bytes)")
-                        
-                    except Exception as e:
-                        logger.warning(f"Failed to upload log file {file_path}: {e}")
-                        continue
-                        
-        except Exception as e:
-            logger.error(f"Failed to upload logs to S3: {e}")
-        
-        logger.info(f"Uploaded {len(uploaded_logs)} log files to S3")
-        return uploaded_logs
-    
-    def initialize_nova_act(self) -> None:
-        """Initialize Nova Act for Lambda environment."""
-        try:
-            # Create logs directory in Lambda's tmp space
-            self.logs_dir = "/tmp/nova_act_logs"
-            os.makedirs(self.logs_dir, exist_ok=True)
-            
-            # Set environment variables for Microsoft Playwright image
-            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/ms-playwright'
-            os.environ['PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD'] = '1'
-            os.environ['NOVA_ACT_SKIP_PLAYWRIGHT_INSTALL'] = '1'
-            
-            # Log environment info for debugging
-            logger.info(f"Python version: {os.sys.version}")
-            logger.info(f"PLAYWRIGHT_BROWSERS_PATH: {os.environ.get('PLAYWRIGHT_BROWSERS_PATH')}")
-            logger.info(f"Available files in /ms-playwright: {os.listdir('/ms-playwright') if os.path.exists('/ms-playwright') else 'Directory not found'}")
-            
-            # Check for Chromium executable
-            chromium_paths = [
-                '/ms-playwright/chromium-*/chrome-linux/chrome',
-                '/ms-playwright/chromium-*/chrome-linux/headless_shell',
-                '/ms-playwright/chromium*/chrome-linux/chrome',
-                '/ms-playwright/chromium*/chrome-linux/headless_shell'
-            ]
-            
-            import glob
-            for pattern in chromium_paths:
-                matches = glob.glob(pattern)
-                if matches:
-                    logger.info(f"Found Chromium executable(s): {matches}")
-                    break
-            else:
-                logger.warning("No Chromium executable found in expected locations")
-            
-            logger.info("Attempting Nova Act initialization with Microsoft Playwright image...")
-            
-            # Try Nova Act with minimal configuration - remove security_options that's causing issues
-            self.nova_act = NovaAct(
-                starting_page="https://www.usps.com/",
-                headless=True,  # Always headless in Lambda
-                logs_directory=self.logs_dir,  # Use Lambda's tmp directory
-                clone_user_data_dir=False,  # Don't clone user data in Lambda
-                go_to_url_timeout=60,
-                nova_act_api_key=os.environ.get("NOVA_ACT_API_KEY"),
-                chrome_channel="chromium",
-            )
-            
-            logger.info("Nova Act initialized successfully for Lambda")
-                
-        except Exception as e:
-            logger.error(f"Failed to initialize Nova Act: {e}")
-            logger.error(f"Error type: {type(e).__name__}")
-            import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            raise
-    
-    def start_and_navigate(self) -> None:
-        """Start session and navigate to login."""
-        try:
-            self.nova_act.start()
-            logger.info("Nova Act session started")
-            
-            # Navigate to sign in with explicit URL tracking to prevent loops
-            current_url = self.nova_act.page.url
-            logger.info(f"Starting URL: {current_url}")
-            
-            account_search = self.nova_act.act(
-                "I need to access my personal USPS account to check my mail. "
-                "Click on the 'sign in' button on the top right of the main page. "
-                "If you're already on a sign-in page, just proceed to the login form."
-            )
-            logger.info(f"Navigation result: {account_search}")
-            
-        except Exception as e:
-            logger.error(f"Failed to start and navigate: {e}")
-            raise
-    
-    def attempt_login(self) -> bool:
-        """Attempt to login with credentials."""
-        try:
-            # self.nova_act.page.wait_for_timeout(3000)
-            
-            # Find and focus username field
-            username_field = self.nova_act.act("Find the username input field and click on it to focus it.")
-            logger.info(f"Username field focused: {username_field}")
-            
-            # Type username
-            self.nova_act.page.keyboard.type(self.username)
-            logger.info("Username entered")
-            
-            # Find and focus password field
-            password_field = self.nova_act.act("Now find the password input field and click on it to focus it.")
-            logger.info(f"Password field focused: {password_field}")
-            
-            # Type password
-            self.nova_act.page.keyboard.type(self.password)
-            logger.info("Password entered")
-            
-            # Submit form
-            submit_result = self.nova_act.act("Click the sign in button to submit the login form.")
-            logger.info(f"Submit result: {submit_result}")
-            
-            # Wait and check login success
-            # self.nova_act.page.wait_for_timeout(6000)
-            
-            login_check = self.nova_act.act(
-                "Check if the login was successful. Look for signs that I'm now logged in, "
-                "such as a user menu, account dashboard, or welcome message. "
-                "If there are any error messages, please report them."
-            )
-            logger.info(f"Login check: {login_check}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Login attempt failed: {e}")
-            return False
-    
-    def find_informed_delivery(self) -> bool:
-        """Navigate to Informed Delivery section."""
-        try:
-            # Track current URL to detect navigation loops
-            current_url = self.nova_act.page.url
-            logger.info(f"Current URL before Informed Delivery search: {current_url}")
-            
-            # Look for Informed Delivery with loop prevention
-            delivery_result = self.nova_act.act(
-                "Click 'Informed Delivery' button or link. "
-                "If you're already on the Informed Delivery page, just proceed."
-            )
-            logger.info(f"Informed Delivery navigation: {delivery_result}")
-            
-            # Look for sign-in button with specific context
-            signin_result = self.nova_act.act(
-                "Look for and click a 'Sign In' button specifically for Informed Delivery. "
-                "It might be below title text that says 'Informed Delivery by USPS'. "
-                "If you're already signed in or on the main Informed Delivery page, just proceed."
-            )
-            logger.info(f"Informed Delivery sign-in: {signin_result}")
-
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to find Informed Delivery: {e}")
-            return False
-    
-    def check_mail_images(self) -> List[str]:
-        """Check for today's mail images and upload to S3."""
-        uploaded_files = []
-        
-        try:
-            # Check what's available
-            mail_check = self.nova_act.act(
-                "I am now in my Informed Delivery section. Look for today's mail images "
-            )
-            logger.info(f"Mail check: {mail_check}")
-            
-            # Search for mail images
-            selectors = [
-                'img[alt*="Mail Piece Images"]',
-                'img[alt*="mail"]',
-                'img[src*="mail"]'
-            ]
-            
-            all_images = []
-            for selector in selectors:
-                images = self.nova_act.page.query_selector_all(selector)
-                logger.info(f"Found {len(images)} potential images with selector: {selector}")
-                
-                # Check each image for address content using Nova Act
-                for i, img in enumerate(images):
-                    try:
-                        # First, check if the image source or alt text suggests it's a mail piece
-                        src = img.get_attribute('src') or ''
-                        alt = img.get_attribute('alt') or ''
-                        
-                        # Skip obvious non-mail images
-                        skip_keywords = ['logo', 'banner', 'icon', 'button', 'nav']
-                        if any(keyword in src.lower() or keyword in alt.lower() for keyword in skip_keywords):
-                            logger.info(f"✗ Skipping image {i+1} - appears to be UI element: {src}")
-                            continue
-                        
-                        # Use Nova Act to analyze the image content for address information
-                        analysis_result = self.nova_act.act(
-                            f"Examine this mail image carefully. Look for addressing information such as: "
-                            f"- Recipient name and address "
-                            f"- Street address, city, state, zip code "
-                            f"- Return address information "
-                            f"- Any text that looks like mailing labels "
-                            f"Respond with 'HAS_ADDRESS' if you can clearly see addressing information, "
-                            f"or 'NO_ADDRESS' if it's blank, just a logo, or contains no addressing text.",
-                            element=img
-                        )
-                        
-                        # Check if Nova Act found address information
-                        analysis_text = str(analysis_result).upper()
-                        if 'HAS_ADDRESS' in analysis_text or any(keyword in analysis_text for keyword in ['ADDRESS', 'RECIPIENT', 'STREET', 'ZIP']):
-                            all_images.append(img)
-                            logger.info(f"✓ Image {i+1} contains address information: {analysis_result}")
-                        else:
-                            logger.info(f"✗ Image {i+1} filtered out - no address information: {analysis_result}")
-                            
-                    except Exception as e:
-                        logger.warning(f"Failed to analyze image {i+1}: {e}")
-                        # If analysis fails, include the image to be safe (better to have false positives)
-                        all_images.append(img)
-                        logger.info(f"⚠ Including image {i+1} due to analysis failure")
-                        continue
-
-            # Remove duplicates
-            unique_images = []
-            seen_srcs = set()
-            for img in all_images:
-                src = img.get_attribute('src')
-                if src and src not in seen_srcs:
-                    unique_images.append(img)
-                    seen_srcs.add(src)
-            
-            logger.info(f"Found {len(unique_images)} unique mail images")
-            
-            # Process each image
-            for i, img in enumerate(unique_images):
-                try:
-                    src = img.get_attribute('src')
-                    if src:
-                        logger.info(f"Processing image {i+1}: {src}")
-                        
-                        # Wait for image to be fully loaded before screenshot
-                        try:
-                            # Wait for the image element to be stable
-                            self.nova_act.page.wait_for_timeout(2000)
-                            
-                            # Check if image is loaded
-                            is_loaded = img.evaluate("img => img.complete && img.naturalHeight !== 0")
-                            if not is_loaded:
-                                logger.warning(f"Image {i+1} may not be fully loaded, waiting...")
-                                self.nova_act.page.wait_for_timeout(3000)
-                        except Exception as load_check_error:
-                            logger.warning(f"Could not verify image load status: {load_check_error}")
-                        
-                        # Take screenshot of the image element with increased timeout
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        filename = f"mail_image_{i+1}_{timestamp}.png"
-                        
-                        # Screenshot to bytes with retry logic and increased timeout
-                        screenshot_bytes = None
-                        max_retries = 3
-                        
-                        for attempt in range(max_retries):
-                            try:
-                                # Increase timeout to 60 seconds and add retry logic
-                                screenshot_bytes = img.screenshot(timeout=60000)
-                                break
-                            except Exception as screenshot_error:
-                                logger.warning(f"Screenshot attempt {attempt + 1} failed for image {i+1}: {screenshot_error}")
-                                if attempt < max_retries - 1:
-                                    # Wait a bit before retrying
-                                    self.nova_act.page.wait_for_timeout(2000)
-                                else:
-                                    logger.error(f"All screenshot attempts failed for image {i+1}")
-                                    raise screenshot_error
-                        
-                        if screenshot_bytes:
-                            # Upload to S3
-                            if self._upload_to_s3(screenshot_bytes, filename):
-                                uploaded_files.append(f"s3://{self.s3_bucket}/{self.today}/{filename}")
-                        else:
-                            logger.warning(f"No screenshot data for image {i+1}")
-                        
-                except Exception as e:
-                    logger.warning(f"Failed to process image {i+1}: {e}")
-                    continue
-            
-            # Fallback: full page screenshot if no images found
-            if not uploaded_files:
-                logger.info("No images found, taking full page screenshot")
-                try:
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    filename = f"mail_preview_full_{timestamp}.png"
-                    
-                    # Full page screenshot with increased timeout and retry logic
-                    screenshot_bytes = None
-                    max_retries = 3
-                    
-                    for attempt in range(max_retries):
-                        try:
-                            screenshot_bytes = self.nova_act.page.screenshot(full_page=True, timeout=90000)
-                            break
-                        except Exception as screenshot_error:
-                            logger.warning(f"Full page screenshot attempt {attempt + 1} failed: {screenshot_error}")
-                            if attempt < max_retries - 1:
-                                self.nova_act.page.wait_for_timeout(3000)
-                            else:
-                                logger.error("All full page screenshot attempts failed")
-                                raise screenshot_error
-                    
-                    if screenshot_bytes and self._upload_to_s3(screenshot_bytes, filename):
-                        uploaded_files.append(f"s3://{self.s3_bucket}/{self.today}/{filename}")
-                        
-                except Exception as e:
-                    logger.error(f"Full page screenshot failed: {e}")
-            
-        except Exception as e:
-            logger.error(f"Failed to check mail images: {e}")
-        
-        return uploaded_files
+    def _upload_callback(self, file_data: bytes, filename: str) -> bool:
+        """Callback function for image uploads."""
+        return self.s3_uploader.upload_file(file_data, filename)
     
     def run(self) -> Dict[str, Any]:
         """Run the automation and return results."""
@@ -458,19 +64,31 @@ class LambdaUSPSAutomator:
         success = False
         error_message = None
         method = "nova_act"
+        nova_act = None
         
         try:
             logger.info("Starting USPS Lambda automation with Nova Act...")
             
-            self.initialize_nova_act()
-            self.start_and_navigate()
+            # Initialize Nova Act
+            nova_act = self.nova_act_config.initialize()
             
-            if self.attempt_login():
+            # Initialize components with Nova Act instance
+            self.authenticator = USPSAuthenticator(nova_act, self.username, self.password)
+            self.image_extractor = MailImageExtractor(nova_act, self._upload_callback)
+            
+            # Execute automation workflow
+            self.authenticator.start_and_navigate()
+            
+            if self.authenticator.attempt_login():
                 logger.info("Login successful, proceeding...")
                 
-                if self.find_informed_delivery():
+                if self.authenticator.find_informed_delivery():
                     logger.info("Found Informed Delivery, checking for mail...")
-                    uploaded_files = self.check_mail_images()
+                    
+                    # Extract images and fix S3 paths
+                    raw_files = self.image_extractor.check_mail_images()
+                    uploaded_files = [f.replace("s3://bucket/", f"s3://{self.s3_bucket}/") for f in raw_files if f]
+                    
                     success = True
                 else:
                     error_message = "Could not access Informed Delivery"
@@ -485,19 +103,15 @@ class LambdaUSPSAutomator:
         
         finally:
             # Stop Nova Act session
-            if self.nova_act:
-                try:
-                    self.nova_act.stop()
-                    logger.info("Nova Act session stopped")
-                except Exception as e:
-                    logger.warning(f"Error stopping Nova Act: {e}")
+            if nova_act:
+                self.nova_act_config.stop()
             
-            # Upload logs to S3 regardless of success/failure (if enabled)
+            # Upload logs to S3 (if enabled)
             upload_logs = os.environ.get('UPLOAD_LOGS_TO_S3', 'true').lower() == 'true'
             if upload_logs:
                 try:
                     logger.info("Uploading Nova Act logs to S3...")
-                    uploaded_logs = self._upload_logs_to_s3()
+                    uploaded_logs = self.s3_uploader.upload_logs(self.nova_act_config.logs_dir)
                 except Exception as e:
                     logger.error(f"Failed to upload logs: {e}")
             else:
@@ -526,7 +140,7 @@ def lambda_handler(event, context):
     # Get environment variables
     s3_bucket = os.environ.get('S3_BUCKET_NAME')
     secret_name = os.environ.get('SECRET_NAME')
-    aws_region = os.environ.get('AWS_REGION', 'us-east-1')  # AWS_REGION is automatically provided by Lambda
+    aws_region = os.environ.get('AWS_REGION', 'us-east-1')
     
     if not s3_bucket or not secret_name:
         error_msg = "Missing required environment variables: S3_BUCKET_NAME, SECRET_NAME"

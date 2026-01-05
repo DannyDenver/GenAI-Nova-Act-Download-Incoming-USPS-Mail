@@ -29,8 +29,10 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV NOVA_ACT_SKIP_PLAYWRIGHT_INSTALL=1
 ENV NOVA_ACT_BROWSER_ARGS="--disable-gpu --disable-dev-shm-usage --no-sandbox --single-process"
 
-# Copy function code
+# Copy all Python modules for the Lambda function
+COPY __init__.py /var/task/
 COPY lambda_function.py /var/task/
+COPY utils/ /var/task/utils/
 
 # Set the entrypoint and command for Lambda
 ENTRYPOINT [ "/usr/bin/python", "-m", "awslambdaric" ]
