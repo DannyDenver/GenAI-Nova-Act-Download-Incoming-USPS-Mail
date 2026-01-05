@@ -63,3 +63,9 @@ variable "nova_act_api_key" {
   type = string
 }
 
+variable "upload_logs_to_s3" {
+  description = "Whether to upload Nova Act logs to S3 bucket"
+  type        = string
+  default     = "true"
+}
+

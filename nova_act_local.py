@@ -1,92 +1,68 @@
 #!/usr/bin/env python3
 """
-AWS Lambda function for USPS Informed Delivery automation.
-Adapted from the conservative USPS automation script.
+Local USPS Informed Delivery automation using Nova Act.
+Runs locally without AWS dependencies.
 """
 
 import os
 import json
-import boto3
 import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-import requests
-from urllib.parse import urljoin
 
 from nova_act import NovaAct
 from nova_act.types.act_result import ActResult
 from nova_act.types.act_errors import ActAgentError, ActClientError, ActExecutionError, ActServerError
 
 # Configure logging
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
-class LambdaUSPSAutomator:
-    """Lambda-compatible USPS automation class."""
+class LocalUSPSAutomator:
+    """Local USPS automation class without AWS dependencies."""
     
-    def __init__(self, s3_bucket: str, secret_name: str, aws_region: str):
-        self.s3_bucket = s3_bucket
-        self.secret_name = secret_name
-        self.aws_region = aws_region
+    def __init__(self, username: str, password: str, output_dir: str = "mail_images"):
+        self.username = username
+        self.password = password
+        self.output_dir = output_dir
         self.nova_act: Optional[NovaAct] = None
         
-        # Initialize AWS clients
-        self.s3_client = boto3.client('s3', region_name=aws_region)
-        self.secrets_client = boto3.client('secretsmanager', region_name=aws_region)
-        
-        # Get credentials from Secrets Manager
-        self.username, self.password = self._get_credentials()
+        # Create output directory
+        os.makedirs(self.output_dir, exist_ok=True)
         
         # Create date-based folder structure
         self.today = datetime.now().strftime("%Y-%m-%d")
+        self.today_dir = os.path.join(self.output_dir, self.today)
+        os.makedirs(self.today_dir, exist_ok=True)
     
-    def _get_credentials(self) -> tuple[str, str]:
-        """Retrieve USPS credentials from AWS Secrets Manager."""
-        try:
-            response = self.secrets_client.get_secret_value(SecretId=self.secret_name)
-            secret_data = json.loads(response['SecretString'])
-            return secret_data['username'], secret_data['password']
-        except Exception as e:
-            logger.error(f"Failed to retrieve credentials: {e}")
-            raise
-    
-    def _upload_to_s3(self, file_data: bytes, filename: str, content_type: str = 'image/png') -> bool:
-        """Upload file data to S3 with retry logic."""
-        s3_key = f"{self.today}/{filename}"
+    def _save_to_file(self, file_data: bytes, filename: str) -> bool:
+        """Save file data to local directory."""
+        file_path = os.path.join(self.today_dir, filename)
         
-        for attempt in range(3):  # Retry up to 3 times
-            try:
-                self.s3_client.put_object(
-                    Bucket=self.s3_bucket,
-                    Key=s3_key,
-                    Body=file_data,
-                    ContentType=content_type,
-                    Metadata={
-                        'download-date': self.today,
-                        'source': 'usps-informed-delivery',
-                        'automation-version': '1.0'
-                    }
-                )
-                logger.info(f"✓ Uploaded to S3: {s3_key}")
-                return True
-            except Exception as e:
-                logger.warning(f"S3 upload attempt {attempt + 1} failed: {e}")
-                if attempt == 2:  # Last attempt
-                    logger.error(f"Failed to upload {filename} after 3 attempts")
-                    return False
-        return False
+        try:
+            with open(file_path, 'wb') as f:
+                f.write(file_data)
+            logger.info(f"✓ Saved to file: {file_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save {filename}: {e}")
+            return False
     
-    def _upload_logs_to_s3(self) -> List[str]:
-        """Upload Nova Act logs to S3."""
-        uploaded_logs = []
+    def _save_logs_to_file(self) -> List[str]:
+        """Save Nova Act logs to local directory."""
+        saved_logs = []
         
         if not hasattr(self, 'logs_dir') or not os.path.exists(self.logs_dir):
-            logger.warning("No logs directory found to upload")
-            return uploaded_logs
+            logger.warning("No logs directory found to save")
+            return saved_logs
+        
+        # Create logs subdirectory
+        logs_output_dir = os.path.join(self.today_dir, "logs")
+        os.makedirs(logs_output_dir, exist_ok=True)
         
         try:
-            # Walk through logs directory and upload all files
+            # Walk through logs directory and copy all files
             for root, dirs, files in os.walk(self.logs_dir):
                 for file in files:
                     file_path = os.path.join(root, file)
@@ -96,101 +72,51 @@ class LambdaUSPSAutomator:
                         logger.debug(f"Skipping empty file: {file_path}")
                         continue
                     
-                    # Create relative path for S3 key
+                    # Create relative path for output
                     rel_path = os.path.relpath(file_path, self.logs_dir)
-                    s3_key = f"{self.today}/logs/{rel_path}"
+                    output_path = os.path.join(logs_output_dir, rel_path)
+                    
+                    # Create subdirectories if needed
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
                     
                     try:
-                        # Determine content type based on file extension
-                        content_type = 'text/plain'
-                        if file.endswith('.json'):
-                            content_type = 'application/json'
-                        elif file.endswith('.html'):
-                            content_type = 'text/html'
-                        elif file.endswith('.png'):
-                            content_type = 'image/png'
-                        elif file.endswith('.log'):
-                            content_type = 'text/plain'
+                        # Copy file
+                        with open(file_path, 'rb') as src, open(output_path, 'wb') as dst:
+                            dst.write(src.read())
                         
-                        # Read and upload file
-                        with open(file_path, 'rb') as f:
-                            file_data = f.read()
-                        
-                        self.s3_client.put_object(
-                            Bucket=self.s3_bucket,
-                            Key=s3_key,
-                            Body=file_data,
-                            ContentType=content_type,
-                            Metadata={
-                                'upload-date': self.today,
-                                'source': 'nova-act-logs',
-                                'automation-version': '1.0',
-                                'log-type': 'automation-trace',
-                                'file-size': str(len(file_data))
-                            }
-                        )
-                        
-                        uploaded_logs.append(f"s3://{self.s3_bucket}/{s3_key}")
-                        logger.info(f"✓ Uploaded log to S3: {s3_key} ({len(file_data)} bytes)")
+                        saved_logs.append(output_path)
+                        logger.info(f"✓ Saved log to: {output_path}")
                         
                     except Exception as e:
-                        logger.warning(f"Failed to upload log file {file_path}: {e}")
+                        logger.warning(f"Failed to save log file {file_path}: {e}")
                         continue
                         
         except Exception as e:
-            logger.error(f"Failed to upload logs to S3: {e}")
+            logger.error(f"Failed to save logs: {e}")
         
-        logger.info(f"Uploaded {len(uploaded_logs)} log files to S3")
-        return uploaded_logs
+        logger.info(f"Saved {len(saved_logs)} log files")
+        return saved_logs
     
     def initialize_nova_act(self) -> None:
-        """Initialize Nova Act for Lambda environment."""
+        """Initialize Nova Act for local environment."""
         try:
-            # Create logs directory in Lambda's tmp space
-            self.logs_dir = "/tmp/nova_act_logs"
+            # Create logs directory in current working directory
+            self.logs_dir = os.path.join(self.output_dir, "nova_act_logs")
             os.makedirs(self.logs_dir, exist_ok=True)
             
-            # Set environment variables for Microsoft Playwright image
-            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/ms-playwright'
-            os.environ['PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD'] = '1'
-            os.environ['NOVA_ACT_SKIP_PLAYWRIGHT_INSTALL'] = '1'
+            logger.info("Initializing Nova Act for local environment...")
             
-            # Log environment info for debugging
-            logger.info(f"Python version: {os.sys.version}")
-            logger.info(f"PLAYWRIGHT_BROWSERS_PATH: {os.environ.get('PLAYWRIGHT_BROWSERS_PATH')}")
-            logger.info(f"Available files in /ms-playwright: {os.listdir('/ms-playwright') if os.path.exists('/ms-playwright') else 'Directory not found'}")
-            
-            # Check for Chromium executable
-            chromium_paths = [
-                '/ms-playwright/chromium-*/chrome-linux/chrome',
-                '/ms-playwright/chromium-*/chrome-linux/headless_shell',
-                '/ms-playwright/chromium*/chrome-linux/chrome',
-                '/ms-playwright/chromium*/chrome-linux/headless_shell'
-            ]
-            
-            import glob
-            for pattern in chromium_paths:
-                matches = glob.glob(pattern)
-                if matches:
-                    logger.info(f"Found Chromium executable(s): {matches}")
-                    break
-            else:
-                logger.warning("No Chromium executable found in expected locations")
-            
-            logger.info("Attempting Nova Act initialization with Microsoft Playwright image...")
-            
-            # Try Nova Act with minimal configuration - remove security_options that's causing issues
+            # Initialize Nova Act with local configuration
             self.nova_act = NovaAct(
                 starting_page="https://www.usps.com/",
-                headless=True,  # Always headless in Lambda
-                logs_directory=self.logs_dir,  # Use Lambda's tmp directory
-                clone_user_data_dir=False,  # Don't clone user data in Lambda
+                headless=False,  # Can be visible for local testing
+                logs_directory=self.logs_dir,
+                clone_user_data_dir=False,
                 go_to_url_timeout=60,
-                nova_act_api_key=os.environ.get("NOVA_ACT_API_KEY"),
-                chrome_channel="chromium",
+                nova_act_api_key=os.environ.get("NOVA_ACT_API_KEY")
             )
             
-            logger.info("Nova Act initialized successfully for Lambda")
+            logger.info("Nova Act initialized successfully for local environment")
                 
         except Exception as e:
             logger.error(f"Failed to initialize Nova Act: {e}")
@@ -260,7 +186,7 @@ class LambdaUSPSAutomator:
         except Exception as e:
             logger.error(f"Login attempt failed: {e}")
             return False
-    
+
     def find_informed_delivery(self) -> bool:
         """Navigate to Informed Delivery section."""
         try:
@@ -290,8 +216,10 @@ class LambdaUSPSAutomator:
             return False
     
     def check_mail_images(self) -> List[str]:
-        """Check for today's mail images and upload to S3."""
-        uploaded_files = []
+        """Check for today's mail images and save to local directory."""
+        saved_files = []
+        
+        # Check if address filtering is enabled
         
         try:
             # Check what's available
@@ -300,7 +228,7 @@ class LambdaUSPSAutomator:
             )
             logger.info(f"Mail check: {mail_check}")
             
-            # Search for mail images
+            # Search for mail images and filter for those with addresses
             selectors = [
                 'img[alt*="Mail Piece Images"]',
                 'img[alt*="mail"]',
@@ -351,7 +279,7 @@ class LambdaUSPSAutomator:
                         all_images.append(img)
                         logger.info(f"⚠ Including image {i+1} due to analysis failure")
                         continue
-
+            
             # Remove duplicates
             unique_images = []
             seen_srcs = set()
@@ -370,77 +298,32 @@ class LambdaUSPSAutomator:
                     if src:
                         logger.info(f"Processing image {i+1}: {src}")
                         
-                        # Wait for image to be fully loaded before screenshot
-                        try:
-                            # Wait for the image element to be stable
-                            self.nova_act.page.wait_for_timeout(2000)
-                            
-                            # Check if image is loaded
-                            is_loaded = img.evaluate("img => img.complete && img.naturalHeight !== 0")
-                            if not is_loaded:
-                                logger.warning(f"Image {i+1} may not be fully loaded, waiting...")
-                                self.nova_act.page.wait_for_timeout(3000)
-                        except Exception as load_check_error:
-                            logger.warning(f"Could not verify image load status: {load_check_error}")
-                        
-                        # Take screenshot of the image element with increased timeout
+                        # Take screenshot of the image element
                         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                         filename = f"mail_image_{i+1}_{timestamp}.png"
                         
-                        # Screenshot to bytes with retry logic and increased timeout
-                        screenshot_bytes = None
-                        max_retries = 3
+                        # Screenshot to bytes
+                        screenshot_bytes = img.screenshot()
                         
-                        for attempt in range(max_retries):
-                            try:
-                                # Increase timeout to 60 seconds and add retry logic
-                                screenshot_bytes = img.screenshot(timeout=60000)
-                                break
-                            except Exception as screenshot_error:
-                                logger.warning(f"Screenshot attempt {attempt + 1} failed for image {i+1}: {screenshot_error}")
-                                if attempt < max_retries - 1:
-                                    # Wait a bit before retrying
-                                    self.nova_act.page.wait_for_timeout(2000)
-                                else:
-                                    logger.error(f"All screenshot attempts failed for image {i+1}")
-                                    raise screenshot_error
-                        
-                        if screenshot_bytes:
-                            # Upload to S3
-                            if self._upload_to_s3(screenshot_bytes, filename):
-                                uploaded_files.append(f"s3://{self.s3_bucket}/{self.today}/{filename}")
-                        else:
-                            logger.warning(f"No screenshot data for image {i+1}")
+                        # Save to local file
+                        if self._save_to_file(screenshot_bytes, filename):
+                            saved_files.append(os.path.join(self.today_dir, filename))
                         
                 except Exception as e:
                     logger.warning(f"Failed to process image {i+1}: {e}")
                     continue
             
             # Fallback: full page screenshot if no images found
-            if not uploaded_files:
+            if not saved_files:
                 logger.info("No images found, taking full page screenshot")
                 try:
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                     filename = f"mail_preview_full_{timestamp}.png"
                     
-                    # Full page screenshot with increased timeout and retry logic
-                    screenshot_bytes = None
-                    max_retries = 3
+                    screenshot_bytes = self.nova_act.page.screenshot(full_page=True)
                     
-                    for attempt in range(max_retries):
-                        try:
-                            screenshot_bytes = self.nova_act.page.screenshot(full_page=True, timeout=90000)
-                            break
-                        except Exception as screenshot_error:
-                            logger.warning(f"Full page screenshot attempt {attempt + 1} failed: {screenshot_error}")
-                            if attempt < max_retries - 1:
-                                self.nova_act.page.wait_for_timeout(3000)
-                            else:
-                                logger.error("All full page screenshot attempts failed")
-                                raise screenshot_error
-                    
-                    if screenshot_bytes and self._upload_to_s3(screenshot_bytes, filename):
-                        uploaded_files.append(f"s3://{self.s3_bucket}/{self.today}/{filename}")
+                    if self._save_to_file(screenshot_bytes, filename):
+                        saved_files.append(os.path.join(self.today_dir, filename))
                         
                 except Exception as e:
                     logger.error(f"Full page screenshot failed: {e}")
@@ -448,19 +331,19 @@ class LambdaUSPSAutomator:
         except Exception as e:
             logger.error(f"Failed to check mail images: {e}")
         
-        return uploaded_files
+        return saved_files
     
     def run(self) -> Dict[str, Any]:
         """Run the automation and return results."""
         start_time = datetime.now()
-        uploaded_files = []        
-        uploaded_logs = []
+        saved_files = []        
+        saved_logs = []
         success = False
         error_message = None
-        method = "nova_act"
+        method = "nova_act_local"
         
         try:
-            logger.info("Starting USPS Lambda automation with Nova Act...")
+            logger.info("Starting local USPS automation with Nova Act...")
             
             self.initialize_nova_act()
             self.start_and_navigate()
@@ -470,7 +353,7 @@ class LambdaUSPSAutomator:
                 
                 if self.find_informed_delivery():
                     logger.info("Found Informed Delivery, checking for mail...")
-                    uploaded_files = self.check_mail_images()
+                    saved_files = self.check_mail_images()
                     success = True
                 else:
                     error_message = "Could not access Informed Delivery"
@@ -492,75 +375,93 @@ class LambdaUSPSAutomator:
                 except Exception as e:
                     logger.warning(f"Error stopping Nova Act: {e}")
             
-            # Upload logs to S3 regardless of success/failure (if enabled)
-            upload_logs = os.environ.get('UPLOAD_LOGS_TO_S3', 'true').lower() == 'true'
-            if upload_logs:
+            # Save logs to local directory (if enabled)
+            save_logs = os.environ.get('SAVE_LOGS', 'true').lower() == 'true'
+            if save_logs:
                 try:
-                    logger.info("Uploading Nova Act logs to S3...")
-                    uploaded_logs = self._upload_logs_to_s3()
+                    logger.info("Saving Nova Act logs to local directory...")
+                    saved_logs = self._save_logs_to_file()
                 except Exception as e:
-                    logger.error(f"Failed to upload logs: {e}")
+                    logger.error(f"Failed to save logs: {e}")
             else:
-                logger.info("Log upload to S3 disabled via UPLOAD_LOGS_TO_S3 environment variable")
+                logger.info("Log saving disabled via SAVE_LOGS environment variable")
         
         execution_time = (datetime.now() - start_time).total_seconds()
         
         return {
             "success": success,
-            "images_downloaded": len(uploaded_files),
-            "s3_uploads": len(uploaded_files),
-            "uploaded_files": uploaded_files,
-            "uploaded_logs": uploaded_logs,
-            "logs_uploaded": len(uploaded_logs),
+            "images_downloaded": len(saved_files),
+            "files_saved": len(saved_files),
+            "saved_files": saved_files,
+            "saved_logs": saved_logs,
+            "logs_saved": len(saved_logs),
             "execution_time": execution_time,
             "date": self.today,
             "method": method,
-            "error_message": error_message
+            "error_message": error_message,
+            "output_directory": self.today_dir
         }
 
 
-def lambda_handler(event, context):
-    """AWS Lambda handler function."""
-    logger.info(f"Lambda function started. Event: {json.dumps(event)}")
+def main():
+    """Main function for local execution."""
+    # Get credentials from environment variables
+    username = os.environ.get('USPS_USERNAME')
+    password = os.environ.get('USPS_PASSWORD')
+    nova_act_api_key = os.environ.get('NOVA_ACT_API_KEY')
     
-    # Get environment variables
-    s3_bucket = os.environ.get('S3_BUCKET_NAME')
-    secret_name = os.environ.get('SECRET_NAME')
-    aws_region = os.environ.get('AWS_REGION', 'us-east-1')  # AWS_REGION is automatically provided by Lambda
+    if not username or not password:
+        logger.error("Missing required environment variables: USPS_USERNAME, USPS_PASSWORD")
+        logger.error("Please set these environment variables before running:")
+        logger.error("export USPS_USERNAME='your-username'")
+        logger.error("export USPS_PASSWORD='your-password'")
+        logger.error("export NOVA_ACT_API_KEY='your-api-key'")
+        logger.error("")
+        logger.error("Optional environment variables:")
+        logger.error("export OUTPUT_DIR='mail_images'  # Default output directory")
+        logger.error("export SAVE_LOGS='true'  # Save Nova Act logs")
+        logger.error("export FILTER_ADDRESS_IMAGES='true'  # Filter images with addresses only")
+        return
     
-    if not s3_bucket or not secret_name:
-        error_msg = "Missing required environment variables: S3_BUCKET_NAME, SECRET_NAME"
-        logger.error(error_msg)
-        return {
-            'statusCode': 500,
-            'body': json.dumps({
-                'success': False,
-                'error': error_msg
-            })
-        }
+    if not nova_act_api_key:
+        logger.error("Missing NOVA_ACT_API_KEY environment variable")
+        logger.error("Please set: export NOVA_ACT_API_KEY='your-api-key'")
+        return
+    
+    # Create output directory
+    output_dir = os.environ.get('OUTPUT_DIR', 'mail_images')
     
     try:
         # Create and run automator
-        automator = LambdaUSPSAutomator(s3_bucket, secret_name, aws_region)
+        automator = LocalUSPSAutomator(username, password, output_dir)
         result = automator.run()
         
-        # Log results
-        logger.info(f"Automation completed: {json.dumps(result)}")
+        # Print results
+        logger.info("=" * 50)
+        logger.info("AUTOMATION COMPLETED")
+        logger.info("=" * 50)
+        logger.info(f"Success: {result['success']}")
+        logger.info(f"Images downloaded: {result['images_downloaded']}")
+        logger.info(f"Files saved: {result['files_saved']}")
+        logger.info(f"Logs saved: {result['logs_saved']}")
+        logger.info(f"Execution time: {result['execution_time']:.2f} seconds")
+        logger.info(f"Output directory: {result['output_directory']}")
         
-        # Return response
-        status_code = 200 if result['success'] else 500
-        return {
-            'statusCode': status_code,
-            'body': json.dumps(result)
-        }
+        if result['saved_files']:
+            logger.info("Saved files:")
+            for file_path in result['saved_files']:
+                logger.info(f"  - {file_path}")
+        
+        if result['error_message']:
+            logger.error(f"Error: {result['error_message']}")
+        
+        return result
         
     except Exception as e:
-        error_msg = f"Lambda execution failed: {str(e)}"
-        logger.error(error_msg)
-        return {
-            'statusCode': 500,
-            'body': json.dumps({
-                'success': False,
-                'error': error_msg
-            })
-        }
+        logger.error(f"Local execution failed: {str(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+
+
+if __name__ == "__main__":
+    main()

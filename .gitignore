@@ -60,6 +60,7 @@ response.json
 .env
 .env.local
 .env.production
+.env.docker
 
 # Nova Act logs and data
 conservative_mail_images/
@@ -72,3 +73,4 @@ nova_act_logs/
 tmp/
 temp/
 NovaAct-USPS-Incoming-Mail/
+mail_images/

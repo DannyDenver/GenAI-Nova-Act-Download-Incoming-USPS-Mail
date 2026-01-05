@@ -14,6 +14,7 @@ resource "aws_lambda_function" "usps_automation" {
       S3_BUCKET_NAME = aws_s3_bucket.mail_images.bucket
       SECRET_NAME    = aws_secretsmanager_secret.usps_credentials.name
       NOVA_ACT_API_KEY = var.nova_act_api_key
+      UPLOAD_LOGS_TO_S3 = var.upload_logs_to_s3
     }
   }
 
