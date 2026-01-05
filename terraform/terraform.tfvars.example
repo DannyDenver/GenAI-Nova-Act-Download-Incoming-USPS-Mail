@@ -1,0 +1,21 @@
+# Copy this file to terraform.tfvars and fill in your values
+
+aws_region = "us-east-1"
+environment = "prod"
+
+# USPS account credentials
+usps_username = "your-usps-username"
+usps_password = "your-usps-password"
+
+# Nova Act API Key (required for browser automation)
+nova_act_api_key = "your-nova-act-api-key-here"
+
+# Optional: Upload Nova Act logs to S3 (default: true)
+# upload_logs_to_s3 = "true"
+
+# Optional: Customize schedule (default is 7 AM UTC daily)
+# schedule_expression = "cron(0 7 * * ? *)"
+
+# Optional: Adjust Lambda settings
+# lambda_timeout = 900      # 15 minutes
+# lambda_memory_size = 3008 # Maximum memory
